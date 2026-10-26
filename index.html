@@ -33,6 +33,14 @@
   .bat .meta{color:var(--muted);font-size:13px;margin-top:6px;line-height:1.5}
   .bat .x{color:var(--muted);font-size:12px;cursor:pointer;background:none;border:none;padding:4px}
   .empty{color:var(--muted);padding:24px;text-align:center}
+  .ctrl{display:flex;gap:8px;margin-top:10px;align-items:center;flex-wrap:wrap}
+  .toggle{flex:1;min-width:120px;font-weight:700;color:#fff}
+  .toggle.on{background:var(--good);border-color:var(--good)}
+  .toggle.off{background:#5a1e1e;border-color:#5a1e1e}
+  .toggle:disabled{opacity:.6}
+  .busy{color:var(--muted)}
+  #toast{display:none;position:fixed;left:50%;bottom:22px;transform:translateX(-50%);
+    background:rgba(0,0,0,.9);color:#fff;padding:12px 18px;border-radius:24px;z-index:900;font-weight:600;border:1px solid var(--line)}
   dialog{background:var(--card);color:var(--text);border:1px solid var(--line);border-radius:14px;padding:18px;width:min(92vw,380px)}
   dialog h3{margin:0 0 10px;color:var(--red)}
   dialog input{width:100%;padding:11px;margin:6px 0 12px;border-radius:8px;border:1px solid var(--line);background:#1c1c1c;color:#fff;font-size:15px}
@@ -51,6 +59,7 @@
 </header>
 <div id="map"></div>
 <div class="list" id="list"><div class="empty">Přidej baterii tlačítkem „+ Baterie“ (název a kód ze sdílení v CoolTechApp).</div></div>
+<div id="toast"></div>
 
 <dialog id="addDlg">
   <h3>Přidat baterii</h3>
@@ -79,9 +88,10 @@ function toHex(b){return Array.from(b).map(x=>x.toString(16).padStart(2,"0")).jo
 async function derive(code){
   const secret = enc.encode(code.replace(/-/g,""));
   const keyBytes = await hmac(secret, "cooltech-key");
-  const aesKey = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["decrypt"]);
+  const aesKey = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["encrypt","decrypt"]);
   const channel = toHex(await hmac(secret, "cooltech-topic")).slice(0,24);
-  return { aesKey, topic:`cooltechapp/v1/${channel}/s` };
+  const base = `cooltechapp/v1/${channel}`;
+  return { aesKey, topic:base+"/s", cmdTopic:base+"/c", resTopic:base+"/r" };
 }
 async function decrypt(aesKey, topic, payload){
   if(payload.length < 28) return null;
@@ -92,6 +102,12 @@ async function decrypt(aesKey, topic, payload){
       {name:"AES-GCM", iv, additionalData:enc.encode(topic), tagLength:128}, aesKey, data);
     return dec.decode(plain);
   }catch(e){ return null; }
+}
+async function encryptMsg(aesKey, topic, plaintext){
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt(
+    {name:"AES-GCM", iv, additionalData:enc.encode(topic), tagLength:128}, aesKey, enc.encode(plaintext)));
+  const out = new Uint8Array(12+ct.length); out.set(iv,0); out.set(ct,12); return out;
 }
 
 // ---------- stav ----------
@@ -176,6 +192,19 @@ function render(){
     } else {
       meta = b.offline ? "Telefon u baterie je offline" : "Není online";
     }
+    let controls = "";
+    if(online && i){
+      if(b.state.ctl){
+        const dis = b.busy ? "disabled" : "";
+        controls = `<div class="ctrl">
+          <button class="toggle ${i.chg?'on':'off'}" ${dis} onclick="sendCommand('${b.code}','charge',${!i.chg})">Nabíjení: ${i.chg?'ZAP':'VYP'}</button>
+          <button class="toggle ${i.dsg?'on':'off'}" ${dis} onclick="sendCommand('${b.code}','discharge',${!i.dsg})">Vybíjení: ${i.dsg?'ZAP':'VYP'}</button>
+          ${b.busy?'<span class="busy">…</span>':''}
+        </div>`;
+      } else {
+        controls = `<div class="meta" style="color:var(--warn)">Ovládání na dálku není povoleno</div>`;
+      }
+    }
     el.innerHTML = `
       <div class="row">
         <span class="dot" style="background:${online?'var(--good)':'var(--bad)'}"></span>
@@ -183,7 +212,8 @@ function render(){
         ${online&&i?`<span class="soc" style="color:${socColor(i.soc)}">${i.soc} %</span>`:""}
         <button class="x" title="Odebrat" onclick="removeBattery('${b.code}')">✕</button>
       </div>
-      <div class="meta">${meta}</div>`;
+      <div class="meta">${meta}</div>
+      ${controls}`;
     list.appendChild(el);
   });
 }
@@ -197,7 +227,7 @@ async function initBatteries(){
   seed.forEach(s=>{ if(!all.some(x=>x.code===s.code)) all.push(s); });
   batteries = [];
   for(const b of all){
-    try{ const d = await derive(b.code); batteries.push({name:b.name,code:b.code,aesKey:d.aesKey,topic:d.topic,state:null,lastMs:0,offline:false}); }
+    try{ const d = await derive(b.code); batteries.push({name:b.name,code:b.code,aesKey:d.aesKey,topic:d.topic,cmdTopic:d.cmdTopic,resTopic:d.resTopic,state:null,lastMs:0,offline:false,busy:false,pending:null}); }
     catch(e){}
   }
   save();
@@ -206,10 +236,18 @@ async function initBatteries(){
 function connect(){
   const clientId = "ct-web-" + Math.random().toString(16).slice(2,10);
   client = mqtt.connect(BROKER, {clientId, clean:true, reconnectPeriod:3000, connectTimeout:15000});
-  client.on("connect", ()=>{ batteries.forEach(b=>client.subscribe(b.topic,{qos:0})); render(); });
+  client.on("connect", ()=>{ batteries.forEach(b=>{ client.subscribe(b.topic,{qos:0}); client.subscribe(b.resTopic,{qos:1}); }); render(); });
   client.on("reconnect", render);
   client.on("close", render);
   client.on("message", async (topic, payload)=>{
+    // výsledek příkazu
+    const br = batteries.find(x=>x.resTopic===topic);
+    if(br){
+      const t = await decrypt(br.aesKey, topic, new Uint8Array(payload)); if(!t) return;
+      let r; try{ r=JSON.parse(t); }catch(e){ return; }
+      if(br.pending && r.id===br.pending){ clearTimeout(br.pendingTimer); br.busy=false; br.pending=null; toast(r.error?("Chyba: "+r.error):"Hotovo"); render(); }
+      return;
+    }
     const b = batteries.find(x=>x.topic===topic); if(!b) return;
     if(payload.length===0){ b.state=null; b.offline=false; b.lastMs=0; render(); updateMap(); return; }
     const txt = await decrypt(b.aesKey, topic, new Uint8Array(payload)); if(!txt) return;
@@ -219,6 +257,28 @@ function connect(){
     b.state = o; b.offline=false; b.lastMs=Date.now();
     render(); updateMap();
   });
+}
+
+// ---------- ovládání na dálku ----------
+let toastTimer=null;
+function toast(msg){
+  const t=document.getElementById("toast"); t.textContent=msg; t.style.display="block";
+  clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.style.display="none",3000);
+}
+async function sendCommand(code, action, on){
+  const b = batteries.find(x=>x.code===code);
+  if(!b || !client || !client.connected){ toast("Nejsi připojený k serveru"); return; }
+  if(b.busy){ return; }
+  if(action==="discharge" && !on && !confirm("Vypnout vybíjení? Baterie přestane napájet tříkolku.")) return;
+  b.busy=true; render();
+  const id = toHex(crypto.getRandomValues(new Uint8Array(8)));
+  const payload = JSON.stringify({id, ts:Date.now(), action, on});
+  try{
+    const enc2 = await encryptMsg(b.aesKey, b.cmdTopic, payload);
+    b.pending=id;
+    b.pendingTimer=setTimeout(()=>{ if(b.busy){ b.busy=false; b.pending=null; toast("Vozidlo neodpovědělo"); render(); } }, 9000);
+    client.publish(b.cmdTopic, enc2, {qos:1});
+  }catch(e){ b.busy=false; toast("Chyba odeslání"); render(); }
 }
 
 // ---------- akce ----------
@@ -232,7 +292,7 @@ async function addBattery(){
   const d = await derive(norm);
   const b = {name,code:norm,aesKey:d.aesKey,topic:d.topic,state:null,lastMs:0,offline:false};
   batteries.push(b); save();
-  if(client && client.connected) client.subscribe(b.topic,{qos:0});
+  if(client && client.connected){ client.subscribe(b.topic,{qos:0}); client.subscribe(b.resTopic,{qos:1}); }
   document.getElementById("addDlg").close();
   render();
 }
@@ -245,7 +305,7 @@ function removeBattery(code){
 }
 function refresh(){
   fittedOnce = false;
-  if(client){ batteries.forEach(b=>{ client.unsubscribe(b.topic); client.subscribe(b.topic,{qos:0}); }); }
+  if(client){ batteries.forEach(b=>{ client.unsubscribe(b.topic); client.subscribe(b.topic,{qos:0}); client.subscribe(b.resTopic,{qos:1}); }); }
   render(); updateMap();
 }
 
