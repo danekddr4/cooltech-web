@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>CoolTech Půjčovna</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<style>
+  :root{
+    --bg:#0a0a0a; --card:#171717; --card2:#202020; --text:#e6e1e1; --muted:#9a9a9a;
+    --red:#f23b3b; --good:#2eb872; --warn:#f2a93b; --bad:#e5484d; --line:#2e2e2e;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--text);
+    font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  header{display:flex;align-items:center;gap:10px;padding:12px 14px;background:#0d1113;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:500}
+  header h1{font-size:18px;margin:0;color:var(--red);font-weight:800}
+  header .sub{font-size:12px;color:var(--muted)}
+  header .spacer{flex:1}
+  button{background:var(--card2);color:var(--text);border:1px solid var(--line);
+    border-radius:8px;padding:8px 12px;font-size:14px;cursor:pointer}
+  button.primary{background:var(--red);border-color:var(--red);color:#fff;font-weight:700}
+  button:active{transform:scale(.98)}
+  #map{height:48vh;width:100%}
+  .list{padding:12px;display:grid;gap:10px;grid-template-columns:repeat(auto-fill,minmax(300px,1fr))}
+  .bat{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}
+  .bat .row{display:flex;align-items:center;gap:10px}
+  .dot{width:12px;height:12px;border-radius:50%;flex:none}
+  .bat .name{font-weight:700;font-size:16px;flex:1}
+  .bat .soc{font-size:26px;font-weight:800}
+  .bat .meta{color:var(--muted);font-size:13px;margin-top:6px;line-height:1.5}
+  .bat .x{color:var(--muted);font-size:12px;cursor:pointer;background:none;border:none;padding:4px}
+  .empty{color:var(--muted);padding:24px;text-align:center}
+  dialog{background:var(--card);color:var(--text);border:1px solid var(--line);border-radius:14px;padding:18px;width:min(92vw,380px)}
+  dialog h3{margin:0 0 10px;color:var(--red)}
+  dialog input{width:100%;padding:11px;margin:6px 0 12px;border-radius:8px;border:1px solid var(--line);background:#1c1c1c;color:#fff;font-size:15px}
+  dialog .actions{display:flex;gap:8px;justify-content:flex-end}
+  .leaflet-popup-content{margin:8px 10px;font-weight:600}
+  a.maps{color:#6cb6ff}
+</style>
+</head>
+<body>
+<header>
+  <h1>CoolTech</h1>
+  <div><div class="sub" id="status">Připojuji…</div></div>
+  <div class="spacer"></div>
+  <button onclick="refresh()">↻ Aktualizovat</button>
+  <button class="primary" onclick="openAdd()">+ Baterie</button>
+</header>
+<div id="map"></div>
+<div class="list" id="list"><div class="empty">Přidej baterii tlačítkem „+ Baterie“ (název a kód ze sdílení v CoolTechApp).</div></div>
+
+<dialog id="addDlg">
+  <h3>Přidat baterii</h3>
+  <label>Název</label>
+  <input id="addName" placeholder="Tříkolka 1">
+  <label>Kód baterie</label>
+  <input id="addCode" placeholder="XXXX-XXXX-XXXX-XXXX" autocapitalize="characters" autocomplete="off">
+  <div class="actions">
+    <button onclick="document.getElementById('addDlg').close()">Zrušit</button>
+    <button class="primary" onclick="addBattery()">Přidat</button>
+  </div>
+</dialog>
+
+<script>
+const BROKER = "wss://broker.hivemq.com:8884/mqtt";
+const STALE_MS = 20000;
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+// ---------- šifrování (stejné odvození jako aplikace) ----------
+async function hmac(secret, msg){
+  const k = await crypto.subtle.importKey("raw", secret, {name:"HMAC",hash:"SHA-256"}, false, ["sign"]);
+  return new Uint8Array(await crypto.subtle.sign("HMAC", k, enc.encode(msg)));
+}
+function toHex(b){return Array.from(b).map(x=>x.toString(16).padStart(2,"0")).join("")}
+async function derive(code){
+  const secret = enc.encode(code.replace(/-/g,""));
+  const keyBytes = await hmac(secret, "cooltech-key");
+  const aesKey = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["decrypt"]);
+  const channel = toHex(await hmac(secret, "cooltech-topic")).slice(0,24);
+  return { aesKey, topic:`cooltechapp/v1/${channel}/s` };
+}
+async function decrypt(aesKey, topic, payload){
+  if(payload.length < 28) return null;
+  const iv = payload.slice(0,12);
+  const data = payload.slice(12); // ciphertext + tag
+  try{
+    const plain = await crypto.subtle.decrypt(
+      {name:"AES-GCM", iv, additionalData:enc.encode(topic), tagLength:128}, aesKey, data);
+    return dec.decode(plain);
+  }catch(e){ return null; }
+}
+
+// ---------- stav ----------
+function socColor(s){ return s<20?"var(--bad)":s<50?"var(--warn)":"var(--good)"; }
+function hexSoc(s){ return s<20?"#e5484d":s<50?"#f2a93b":"#2eb872"; }
+function ago(ms){ if(!ms) return "–"; const s=Math.max(0,(Date.now()-ms)/1000|0);
+  return s<60?`před ${s} s`:s<3600?`před ${s/60|0} min`:`před ${s/3600|0} h`; }
+
+let batteries = [];      // {name, code, aesKey, topic, state, lastMs, offline}
+let client = null;
+let markers = {};        // code -> L.marker
+let fittedOnce = false;
+
+function load(){ try{ return JSON.parse(localStorage.getItem("cooltech_fleet")||"[]"); }catch(e){ return []; } }
+function save(){ localStorage.setItem("cooltech_fleet", JSON.stringify(batteries.map(b=>({name:b.name,code:b.code})))); }
+
+// z URL ?codes=KOD1,KOD2 (volitelné seedování)
+function seedFromUrl(){
+  const p = new URLSearchParams(location.search).get("codes");
+  if(!p) return [];
+  return p.split(",").map(c=>c.trim()).filter(Boolean).map(c=>({name:"Baterie", code:c.toUpperCase()}));
+}
+
+// ---------- mapa ----------
+const map = L.map("map",{zoomControl:true}).setView([49.8,15.5], 7);
+const street = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+  {maxZoom:19, attribution:"© OpenStreetMap"}).addTo(map);
+const sat = L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+  {maxZoom:20, attribution:"© Esri, Maxar"});
+L.control.layers({"Mapa":street,"Satelit":sat},null,{position:"topright"}).addTo(map);
+
+function updateMap(){
+  const pts=[];
+  batteries.forEach(b=>{
+    const online = isOnline(b);
+    const loc = b.state && b.state.loc;
+    if(online && loc){
+      pts.push([loc.lat, loc.lon]);
+      const soc = b.state.info ? b.state.info.soc : 0;
+      if(!markers[b.code]){
+        markers[b.code] = L.circleMarker([loc.lat,loc.lon],{radius:10,weight:3,color:"#fff"}).addTo(map);
+      }
+      markers[b.code].setLatLng([loc.lat,loc.lon])
+        .setStyle({fillColor:hexSoc(soc),fillOpacity:1})
+        .bindTooltip(`${b.name} · ${soc} %`,{permanent:true,direction:"bottom",offset:[0,10]});
+    } else if(markers[b.code]){
+      map.removeLayer(markers[b.code]); delete markers[b.code];
+    }
+  });
+  if(pts.length && !fittedOnce){
+    fittedOnce = true;
+    if(pts.length===1) map.setView(pts[0], 16); else map.fitBounds(pts,{padding:[50,50]});
+  }
+  if(!pts.length) fittedOnce = false;
+}
+
+function isOnline(b){ return b.state && !b.offline && b.lastMs && (Date.now()-b.lastMs)<STALE_MS; }
+
+// ---------- vykreslení seznamu ----------
+function render(){
+  const list = document.getElementById("list");
+  const onlineCount = batteries.filter(isOnline).length;
+  document.getElementById("status").textContent =
+    (client && client.connected ? "server online · " : "připojuji… · ") + `${onlineCount} online z ${batteries.length}`;
+
+  if(!batteries.length){ list.innerHTML = '<div class="empty">Přidej baterii tlačítkem „+ Baterie“.</div>'; return; }
+  list.innerHTML = "";
+  batteries.forEach(b=>{
+    const online = isOnline(b);
+    const i = b.state && b.state.info;
+    const loc = b.state && b.state.loc;
+    const el = document.createElement("div"); el.className="bat";
+    let meta = "";
+    if(online && i){
+      meta = `${i.v.toFixed(1)} V · ${i.i.toFixed(1)} A · ${i.rem.toFixed(1)}/${i.nom.toFixed(1)} Ah`;
+      if(loc){
+        meta += `<br>📍 ${loc.acc?("±"+Math.round(loc.acc)+" m"):""} ${loc.lt?("· poloha "+ago(loc.lt)):""}` +
+          ` · <a class="maps" href="https://maps.google.com/?q=${loc.lat},${loc.lon}" target="_blank">mapa</a>`;
+        if(loc.spd>1) meta += ` · ${Math.round(loc.spd)} km/h`;
+      } else meta += "<br>bez polohy (čeká na GPS)";
+      meta += `<br>aktualizováno ${ago(b.lastMs)}`;
+    } else {
+      meta = b.offline ? "Telefon u baterie je offline" : "Není online";
+    }
+    el.innerHTML = `
+      <div class="row">
+        <span class="dot" style="background:${online?'var(--good)':'var(--bad)'}"></span>
+        <span class="name">${escapeHtml(b.name)}</span>
+        ${online&&i?`<span class="soc" style="color:${socColor(i.soc)}">${i.soc} %</span>`:""}
+        <button class="x" title="Odebrat" onclick="removeBattery('${b.code}')">✕</button>
+      </div>
+      <div class="meta">${meta}</div>`;
+    list.appendChild(el);
+  });
+}
+function escapeHtml(s){ return (s||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+// ---------- MQTT ----------
+async function initBatteries(){
+  const stored = load();
+  const seed = seedFromUrl();
+  const all = [...stored];
+  seed.forEach(s=>{ if(!all.some(x=>x.code===s.code)) all.push(s); });
+  batteries = [];
+  for(const b of all){
+    try{ const d = await derive(b.code); batteries.push({name:b.name,code:b.code,aesKey:d.aesKey,topic:d.topic,state:null,lastMs:0,offline:false}); }
+    catch(e){}
+  }
+  save();
+}
+
+function connect(){
+  const clientId = "ct-web-" + Math.random().toString(16).slice(2,10);
+  client = mqtt.connect(BROKER, {clientId, clean:true, reconnectPeriod:3000, connectTimeout:15000});
+  client.on("connect", ()=>{ batteries.forEach(b=>client.subscribe(b.topic,{qos:0})); render(); });
+  client.on("reconnect", render);
+  client.on("close", render);
+  client.on("message", async (topic, payload)=>{
+    const b = batteries.find(x=>x.topic===topic); if(!b) return;
+    if(payload.length===0){ b.state=null; b.offline=false; b.lastMs=0; render(); updateMap(); return; }
+    const txt = await decrypt(b.aesKey, topic, new Uint8Array(payload)); if(!txt) return;
+    let o; try{ o = JSON.parse(txt); }catch(e){ return; }
+    if(o.t==="offline"){ b.offline=true; render(); updateMap(); return; }
+    if(o.t!=="state") return;
+    b.state = o; b.offline=false; b.lastMs=Date.now();
+    render(); updateMap();
+  });
+}
+
+// ---------- akce ----------
+function openAdd(){ document.getElementById("addName").value=""; document.getElementById("addCode").value=""; document.getElementById("addDlg").showModal(); }
+async function addBattery(){
+  const name = document.getElementById("addName").value.trim() || "Baterie";
+  const code = document.getElementById("addCode").value.trim().toUpperCase();
+  if(!/^[A-Z2-9]{4}-?[A-Z2-9]{4}-?[A-Z2-9]{4}-?[A-Z2-9]{4}$/.test(code)){ alert("Neplatný kód."); return; }
+  const norm = code.replace(/-/g,"").replace(/(.{4})/g,"$1-").slice(0,19);
+  if(batteries.some(b=>b.code===norm)){ document.getElementById("addDlg").close(); return; }
+  const d = await derive(norm);
+  const b = {name,code:norm,aesKey:d.aesKey,topic:d.topic,state:null,lastMs:0,offline:false};
+  batteries.push(b); save();
+  if(client && client.connected) client.subscribe(b.topic,{qos:0});
+  document.getElementById("addDlg").close();
+  render();
+}
+function removeBattery(code){
+  const b = batteries.find(x=>x.code===code); if(!b) return;
+  if(!confirm("Odebrat "+b.name+"?")) return;
+  if(client) client.unsubscribe(b.topic);
+  if(markers[code]){ map.removeLayer(markers[code]); delete markers[code]; }
+  batteries = batteries.filter(x=>x.code!==code); save(); render(); updateMap();
+}
+function refresh(){
+  fittedOnce = false;
+  if(client){ batteries.forEach(b=>{ client.unsubscribe(b.topic); client.subscribe(b.topic,{qos:0}); }); }
+  render(); updateMap();
+}
+
+// průběžně aktualizuje "online / stáří"
+setInterval(()=>{ render(); updateMap(); }, 1000);
+
+(async ()=>{ await initBatteries(); render(); connect(); setTimeout(()=>map.invalidateSize(),300); })();
+</script>
+</body>
+</html>
